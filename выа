@@ -1,0 +1,245 @@
+--[[
+    SILENT AIM v2 | Roblox HvH
+    - hooks __index  : Camera.CFrame, Mouse.Hit, Mouse.UnitRay, Mouse.Target
+    - hooks __namecall: Camera:ViewportPointToRay / ScreenPointToRay (engine ray path)
+    - debug counter   : proves whether the game reads the camera in Lua
+]]
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace        = game:GetService("Workspace")
+
+local LP     = Players.LocalPlayer
+local Mouse  = LP:GetMouse()
+local Camera = Workspace.CurrentCamera
+
+-- ================= CONFIG =================
+local CFG = {
+    enabled    = true,
+    keybind    = Enum.KeyCode.F,
+    holdMode   = false,
+    fov        = 400,
+    teamCheck  = false,
+    wallCheck  = false,
+    aimPart    = "Head",
+    prediction = 0.12,
+    showFov    = true,
+    debug      = true,
+}
+
+-- ================= STATE =================
+local computing = false
+local readCount = 0
+local lastTargetName = "-"
+local aimedCameraCFrame, aimedMouseHit, aimedMouseRay
+
+-- ================= HELPERS =================
+local function alive(plr)
+    local char = plr.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0
+end
+
+local function aimPart(plr)
+    local char = plr.Character
+    if not char then return nil end
+    return char:FindFirstChild(CFG.aimPart)
+        or char:FindFirstChild("Head")
+        or char:FindFirstChild("HumanoidRootPart")
+end
+
+local function screenCenter()
+    local v = Camera.ViewportSize
+    return Vector2.new(v.X * 0.5, v.Y * 0.5)
+end
+
+local function screenDist(part)
+    local p, on = Camera:WorldToViewportPoint(part.Position)
+    if not on then return math.huge end
+    return (Vector2.new(p.X, p.Y) - screenCenter()).Magnitude
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function wallClear(part)
+    if not CFG.wallCheck then return true end
+    local origin = Camera.CFrame.Position
+    rayParams.FilterDescendantsInstances = { LP.Character, part.Parent }
+    return Workspace:Raycast(origin, part.Position - origin, rayParams) == nil
+end
+
+local function isValid(plr)
+    if plr == LP or not alive(plr) then return false end
+    if CFG.teamCheck and plr.Team and LP.Team and plr.Team == LP.Team then return false end
+    local part = aimPart(plr)
+    return part ~= nil and wallClear(part)
+end
+
+local function getTarget()
+    local best, bestDist = nil, CFG.fov
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if isValid(plr) then
+            local part = aimPart(plr)
+            if part then
+                local d = screenDist(part)
+                if d <= bestDist then best, bestDist = plr, d end
+            end
+        end
+    end
+    return best
+end
+
+local function predictedPos(part)
+    local pos = part.Position
+    if CFG.prediction > 0 then
+        pos = pos + (part.AssemblyLinearVelocity or Vector3.zero) * CFG.prediction
+    end
+    return pos
+end
+
+-- ================= HOOK INSTALL =================
+local oldIndex, oldNamecall
+
+local function indexHook(self, key)
+    if not computing and CFG.enabled then
+        if (self == Camera or self == Workspace.CurrentCamera) and key == "CFrame" and aimedCameraCFrame then
+            readCount = readCount + 1
+            return aimedCameraCFrame
+        end
+        if self == Mouse then
+            if key == "Hit" and aimedMouseHit then return aimedMouseHit end
+            if key == "UnitRay" and aimedMouseRay then return aimedMouseRay end
+            if key == "Target" and lastTargetName ~= "-" then
+                local plr = Players:FindFirstChild(lastTargetName)
+                if plr then local p = aimPart(plr); if p then return p end end
+            end
+        end
+    end
+    return oldIndex(self, key)
+end
+
+local function namecallHook(self, ...)
+    local method = getnamecallmethod and getnamecallmethod()
+    if not computing and CFG.enabled and aimedMouseRay and self == Camera then
+        if method == "ViewportPointToRay" or method == "ScreenPointToRay" then
+            return aimedMouseRay
+        end
+    end
+    return oldNamecall(self, ...)
+end
+
+local function installHooks()
+    local ok, err = pcall(function()
+        if hookmetamethod then
+            local wrap = newcclosure or function(f) return f end
+            oldIndex    = hookmetamethod(game, "__index",    wrap(indexHook))
+            oldNamecall = hookmetamethod(game, "__namecall", wrap(namecallHook))
+        elseif getrawmetatable then
+            local mt = getrawmetatable(game)
+            oldIndex    = mt.__index
+            oldNamecall = mt.__namecall
+            if setreadonly then setreadonly(mt, false) end
+            mt.__index    = function(s, k)  return indexHook(s, k)  end
+            mt.__namecall = function(s, ...) return namecallHook(s, ...) end
+            if setreadonly then setreadonly(mt, true) end
+        else
+            error("executor exposes neither hookmetamethod nor getrawmetatable")
+        end
+    end)
+    if not ok then
+        warn("[silentaim] hook install failed: " .. tostring(err))
+        return false
+    end
+    return true
+end
+
+installHooks()
+
+-- ================= FOV =================
+local fovCircle
+pcall(function()
+    fovCircle = Drawing.new("Circle")
+    fovCircle.Thickness    = 1
+    fovCircle.NumSides     = 64
+    fovCircle.Color        = Color3.fromRGB(255, 255, 255)
+    fovCircle.Transparency = 0.45
+    fovCircle.Filled       = false
+end)
+
+-- ================= AIM =================
+local function clearAim()
+    aimedCameraCFrame, aimedMouseHit, aimedMouseRay = nil, nil, nil
+end
+
+local function updateAim()
+    if not CFG.enabled then clearAim() return end
+
+    local target = getTarget()
+    if not target then clearAim() lastTargetName = "-" return end
+
+    local part = aimPart(target)
+    if not part then clearAim() return end
+
+    lastTargetName = target.Name
+
+    -- read the TRUE cframe with the hook bypassed
+    computing = true
+    local trueCF = Camera.CFrame
+    computing = false
+
+    local origin = trueCF.Position
+    local pos    = predictedPos(part)
+    local dir    = (pos - origin).Unit
+
+    aimedCameraCFrame = CFrame.lookAt(origin, pos)
+
+    local hitPoint = origin + dir * 1000
+    aimedMouseHit  = CFrame.new(hitPoint, hitPoint + dir)
+    aimedMouseRay  = Ray.new(origin, dir)
+end
+
+-- ================= LOOP =================
+RunService.RenderStepped:Connect(function()
+    if Workspace.CurrentCamera ~= Camera then
+        Camera = Workspace.CurrentCamera
+    end
+    updateAim()
+    if fovCircle then
+        fovCircle.Position = screenCenter()
+        fovCircle.Radius   = CFG.fov
+        fovCircle.Visible  = CFG.showFov and CFG.enabled
+    end
+end)
+
+-- ================= KEYBIND =================
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == CFG.keybind then
+        CFG.enabled = CFG.holdMode and true or (not CFG.enabled)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input, gp)
+    if gp then return end
+    if CFG.holdMode and input.KeyCode == CFG.keybind then
+        CFG.enabled = false
+    end
+end)
+
+-- ================= DEBUG =================
+if CFG.debug then
+    task.spawn(function()
+        while true do
+            task.wait(5)
+            print(("[silentaim] enabled=%s target=%s cameraReads=%d")
+                :format(tostring(CFG.enabled), lastTargetName, readCount))
+            readCount = 0
+        end
+    end)
+end
+
+print("[silent aim v2] loaded | F = toggle")
